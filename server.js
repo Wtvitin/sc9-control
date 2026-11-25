@@ -9,6 +9,10 @@ const util = require("util");
 
 const PORT = process.env.PORT || 3000;
 const APP_PASSWORD = process.env.APP_PASSWORD || ""; // vazio = sem senha (não recomendado em produção)
+const ENTREGAS_SYNC_OBJ = "entregas-sync.json";
+const ENTREGAS_SYNC_INTERVAL_MS = Math.max(5, Number(process.env.ENTREGAS_SYNC_MINUTES || 30)) * 60 * 1000;
+const entregasSync = () => require("./sharepoint-entregas");
+let entregasSyncStatus = { ultimaTentativa: null, ultimoSucesso: null, erro: null };
 const COOKIE_NAME = "sc9_auth";
 const PUBLIC_DIR = __dirname; // tudo solto na raiz do projeto agora — sem pasta "public"
 // só estes dois arquivos podem ser servidos por HTTP — evita expor server.js/storage.js
@@ -35,6 +39,41 @@ const CONTROLE_SD3_OBJ = "controle-sd3.json"; // { coberturaAte, desde, semRegis
 const usingSupabase = Boolean(SB_URL && SB_KEY);
 const saveSnapshot = (d) => objSave("latest.json", d); // mesmo arquivo/bucket de antes (era do storage.js)
 const loadSnapshot = () => objLoad("latest.json");
+async function loadSnapshotComEntregas() {
+  const snapshot = await loadSnapshot();
+  if (!snapshot) return null;
+  const dados = await objLoad(ENTREGAS_SYNC_OBJ).catch((e) => {
+    console.error("Erro ao ler sincronização de entregas:", e);
+    return null;
+  });
+  if (!dados || !Array.isArray(dados.entregaCounts) || !Array.isArray(dados.entregaInfo)) return snapshot;
+  return { ...snapshot, entregaPresent:true, entregaCounts:dados.entregaCounts, entregaInfo:dados.entregaInfo,
+    entregasSincronizadasEm:dados.atualizadoEm };
+}
+async function executarEntregasSync() {
+  return comFila("entregas-sync", async () => {
+    entregasSyncStatus.ultimaTentativa = new Date().toISOString();
+    try {
+      const leitor = entregasSync();
+      if (!leitor.isConfigured()) throw new Error("Credenciais Microsoft Graph não configuradas.");
+      const dados = await leitor.fetchEntregas();
+      await objSave(ENTREGAS_SYNC_OBJ, dados);
+      entregasSyncStatus.ultimoSucesso = dados.atualizadoEm;
+      entregasSyncStatus.erro = null;
+      return { atualizadoEm:dados.atualizadoEm, aba:dados.aba,
+        pedidos:dados.entreguePedidos, registros:dados.entregueRegistros };
+    } catch (e) {
+      entregasSyncStatus.erro = String(e.message || e);
+      console.error("Falha na sincronização de entregas:", entregasSyncStatus.erro);
+      throw e;
+    }
+  });
+}
+setInterval(() => {
+  if (process.env.MS_TENANT_ID && process.env.MS_CLIENT_ID && process.env.MS_CLIENT_SECRET)
+    executarEntregasSync().catch(() => {});
+}, ENTREGAS_SYNC_INTERVAL_MS).unref();
+
 const objUrl = (name) => `${SB_URL.replace(/\/$/, "")}/storage/v1/object/${SB_BUCKET}/${name}`;
 
 // A Render cobra a banda que SAI do servidor — e cada gravação no Supabase é o arquivo
@@ -1287,10 +1326,24 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 500, erroPublico(e, "erro ao salvar"));
     }
   }
+  if (pathname === "/api/entregas-sync/status" && method === "GET") {
+    if (!(await exigir(req, res, ["admin"]))) return;
+    return sendJson(res, 200, {
+      configurado: !!(process.env.MS_TENANT_ID && process.env.MS_CLIENT_ID &&
+        process.env.MS_CLIENT_SECRET && ((process.env.MS_DRIVE_ID && process.env.MS_ITEM_ID) ||
+        process.env.SHAREPOINT_ENTREGAS_URL)),
+      intervaloMinutos: ENTREGAS_SYNC_INTERVAL_MS / 60000, ...entregasSyncStatus
+    });
+  }
+  if (pathname === "/api/entregas-sync/run" && method === "POST") {
+    if (!(await exigir(req, res, ["admin"]))) return;
+    try { return sendJson(res, 200, {ok:true, ...await executarEntregasSync()}); }
+    catch (e) { return sendJson(res, 502, {error: String(e.message || e)}); }
+  }
   if (pathname === "/api/load" && method === "GET") {
     if (!(await exigir(req, res, ["admin"]))) return;
     try {
-      const data = await loadSnapshot();
+      const data = await loadSnapshotComEntregas();
       if (!data) return sendJson(res, 404, { error: "nenhum snapshot salvo ainda" });
       return sendJson(res, 200, data);
     } catch (e) {
